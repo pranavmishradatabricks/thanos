@@ -31,7 +31,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
@@ -339,6 +338,8 @@ func (h *Handler) Hashring(hashring Hashring) {
 				level.Error(h.logger).Log("msg", "closing gRPC connection failed, we might have leaked a file descriptor", "addr", node, "err", err.Error())
 			}
 		}
+
+		h.hashring.Close()
 	}
 
 	h.hashring = hashring
@@ -928,14 +929,9 @@ func (h *Handler) distributeTimeseriesToReplicas(
 
 			tenantLabel := lbls.Get(h.splitTenantLabelName)
 			if tenantLabel != "" {
-				tenant = tenantLabel
-
-				newLabels := labels.NewBuilder(lbls)
-				newLabels.Del(h.splitTenantLabelName)
-
-				ts.Labels = labelpb.ZLabelsFromPromLabels(
-					newLabels.Labels(),
-				)
+				tenant = h.splitTenantLabelName + ":" + tenantLabel
+			} else {
+				tenant = h.options.DefaultTenantID
 			}
 		}
 

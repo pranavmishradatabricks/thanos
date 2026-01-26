@@ -17,17 +17,15 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"go.uber.org/atomic"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-
 	"github.com/thanos-io/objstore"
+	"go.uber.org/atomic"
+	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 
 	"github.com/thanos-io/thanos/pkg/api/status"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -37,6 +35,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
@@ -62,12 +61,15 @@ type MultiTSDB struct {
 	hashFunc              metadata.HashFunc
 	hashringConfigs       []HashringConfig
 
+	matcherCache storecache.MatchersCache
+
 	tsdbClients     []store.Client
 	exemplarClients map[string]*exemplars.TSDB
 
-	metricNameFilterEnabled bool
-	matcherConverter        *storepb.MatcherConverter
-	noUploadTenants         []string // Support both exact matches and prefix patterns (e.g., "tenant1", "prod-*")
+	metricNameFilterEnabled  bool
+	noUploadTenants          []string // Support both exact matches and prefix patterns (e.g., "tenant1", "prod-*")
+	enableTenantPathPrefix   bool
+	pathSegmentsBeforeTenant []string
 }
 
 // MultiTSDBOption is a functional option for MultiTSDB.
@@ -80,18 +82,31 @@ func WithMetricNameFilterEnabled() MultiTSDBOption {
 	}
 }
 
-// WithMatcherConverter enables caching matcher converter consumed by children TSDB Stores.
-func WithMatcherConverter(mc *storepb.MatcherConverter) MultiTSDBOption {
-	return func(s *MultiTSDB) {
-		s.matcherConverter = mc
-	}
-}
-
 // WithNoUploadTenants sets the list of tenant IDs/patterns that should not upload to object store (local storage only).
 // Supports exact matches (e.g., "tenant1") and prefix patterns (e.g., "prod-*" matches "prod-tenant1", "prod-tenant2").
 func WithNoUploadTenants(tenants []string) MultiTSDBOption {
 	return func(s *MultiTSDB) {
 		s.noUploadTenants = tenants
+	}
+}
+
+// WithTenantPathPrefix enables the tenant path prefix for object store.
+func WithTenantPathPrefix() MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.enableTenantPathPrefix = true
+	}
+}
+
+// WithPathSegmentsBeforeTenant sets the path segments before the tenant for object store.
+func WithPathSegmentsBeforeTenant(segments []string) MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.pathSegmentsBeforeTenant = segments
+	}
+}
+
+func WithMatchersCache(cache storecache.MatchersCache) MultiTSDBOption {
+	return func(s *MultiTSDB) {
+		s.matcherCache = cache
 	}
 }
 
@@ -127,6 +142,7 @@ func NewMultiTSDB(
 		bucket:                bucket,
 		allowOutOfOrderUpload: allowOutOfOrderUpload,
 		hashFunc:              hashFunc,
+		matcherCache:          storecache.NoopMatchersCache,
 	}
 
 	for _, option := range options {
@@ -417,6 +433,10 @@ func (t *MultiTSDB) Open() error {
 	for _, f := range files {
 		f := f
 		if !f.IsDir() {
+			continue
+		}
+		// Skip the ext4 filesystem's lost+found directory.
+		if f.Name() == "lost+found" {
 			continue
 		}
 
@@ -780,6 +800,10 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	// into other ones. This presents a race between compaction and the shipper (if it is configured to upload compacted blocks).
 	// Hence, avoid this situation by disabling overlapping compaction. Vertical compaction must be enabled on the compactor.
 	opts.EnableOverlappingCompaction = false
+
+	// We don't do scrapes ourselves so this only gives us a performance penalty.
+	opts.IsolationDisabled = true
+
 	s, err := tsdb.Open(
 		dataDir,
 		level.NewFilter(logger, level.AllowError()),
@@ -793,11 +817,20 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 	}
 	var ship *shipper.Shipper
 	if t.bucket != nil && !t.isNoUploadTenant(tenantID) {
+		var tenantBucket objstore.Bucket
+		if t.enableTenantPathPrefix {
+			segmentsBeforeTenant := path.Join(t.pathSegmentsBeforeTenant...)
+			tenantPrefix := path.Join(segmentsBeforeTenant, tenantID)
+			tenantBucket = objstore.NewPrefixedBucket(t.bucket, tenantPrefix)
+			level.Info(logger).Log("msg", "assigning shipper bucket with tenant path prefix", "tenantPrefix", tenantPrefix)
+		} else {
+			tenantBucket = t.bucket
+		}
 		ship = shipper.New(
 			logger,
 			reg,
 			dataDir,
-			t.bucket,
+			tenantBucket,
 			func() labels.Labels { return lset },
 			metadata.ReceiveSource,
 			nil,
@@ -806,13 +839,12 @@ func (t *MultiTSDB) startTSDB(logger log.Logger, tenantID string, tenant *tenant
 			shipper.DefaultMetaFilename,
 		)
 	}
-	options := []store.TSDBStoreOption{}
+	var options []store.TSDBStoreOption
 	if t.metricNameFilterEnabled {
 		options = append(options, store.WithCuckooMetricNameStoreFilter())
 	}
-	// Pass matcher converter to children TSDB Stores.
-	if t.matcherConverter != nil {
-		options = append(options, store.WithTSDBStoreMatcherConverter(t.matcherConverter))
+	if t.matcherCache != nil {
+		options = append(options, store.WithMatcherCacheInstance(t.matcherCache))
 	}
 	tenant.set(store.NewTSDBStore(logger, s, component.Receive, lset, options...), s, ship, exemplars.NewTSDB(s, lset))
 	t.addTenantLocked(tenantID, tenant) // need to update the client list once store is ready & client != nil

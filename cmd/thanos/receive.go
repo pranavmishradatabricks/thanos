@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -29,12 +28,10 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/wlog"
-	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"google.golang.org/grpc"
-
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
 	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
+	"google.golang.org/grpc"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -52,6 +49,7 @@ import (
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tls"
@@ -100,6 +98,8 @@ func registerReceive(app *extkingpin.App) {
 			MaxExemplars:                   conf.tsdbMaxExemplars,
 			EnableExemplarStorage:          conf.tsdbMaxExemplars > 0,
 			HeadChunksWriteQueueSize:       int(conf.tsdbWriteQueueSize),
+			HeadChunksWriteBufferSize:      conf.tsdbHeadChunksWriteBufferSize,
+			StripeSize:                     conf.tsdbStripeSize,
 			EnableMemorySnapshotOnShutdown: conf.tsdbMemorySnapshotOnShutdown,
 			EnableNativeHistograms:         conf.tsdbEnableNativeHistograms,
 		}
@@ -162,18 +162,14 @@ func runReceive(
 		level.Info(logger).Log("msg", "configured tenants for local storage only", "tenants", strings.Join(*conf.noUploadTenants, ","))
 	}
 
-	// Create a matcher converter if specified by command line to cache expensive regex matcher conversions.
-	// Proxy store and TSDB stores of all tenants share a single cache.
-	var matcherConverter *storepb.MatcherConverter
-	if conf.matcherConverterCacheCapacity > 0 {
-		var err error
-		matcherConverter, err = storepb.NewMatcherConverter(conf.matcherConverterCacheCapacity, reg)
-		if err != nil {
-			level.Error(logger).Log("msg", "failed to create matcher converter", "err", err)
-		}
+	if conf.tsdbEnableTenantPathPrefix {
+		multiTSDBOptions = append(multiTSDBOptions, receive.WithTenantPathPrefix())
+		level.Info(logger).Log("msg", "tenant path prefix feature enabled")
 	}
-	if matcherConverter != nil {
-		multiTSDBOptions = append(multiTSDBOptions, receive.WithMatcherConverter(matcherConverter))
+
+	if len(conf.tsdbPathSegmentsBeforeTenant) > 0 {
+		multiTSDBOptions = append(multiTSDBOptions, receive.WithPathSegmentsBeforeTenant(conf.tsdbPathSegmentsBeforeTenant))
+		level.Info(logger).Log("msg", "tenant path segments before tenant feature enabled", "segments", path.Join(conf.tsdbPathSegmentsBeforeTenant...))
 	}
 
 	rwTLSConfig, err := tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), conf.rwServerCert, conf.rwServerKey, conf.rwServerClientCA, conf.rwServerTlsMinVersion)
@@ -234,16 +230,24 @@ func runReceive(
 		}
 	}
 
-	// TODO(brancz): remove after a couple of versions
-	// Migrate non-multi-tsdb capable storage to multi-tsdb disk layout.
-	if err := migrateLegacyStorage(logger, conf.dataDir, conf.defaultTenantID); err != nil {
-		return errors.Wrapf(err, "migrate legacy storage in %v to default tenant %v", conf.dataDir, conf.defaultTenantID)
+	// Create TSDB for the default tenant.
+	if err := createDefautTenantTSDB(logger, conf.dataDir, conf.defaultTenantID); err != nil {
+		return errors.Wrapf(err, "create default tenant tsdb in %v", conf.dataDir)
 	}
 
 	relabeller, err := receive.NewRelabeller(conf.relabelConfigPath, reg, logger, conf.relabelConfigReloadTimer)
 
 	if err != nil {
 		return errors.Wrap(err, "get content of relabel configuration")
+	}
+
+	var cache = storecache.NoopMatchersCache
+	if conf.matcherCacheSize > 0 {
+		cache, err = storecache.NewMatchersCache(storecache.WithSize(conf.matcherCacheSize), storecache.WithPromRegistry(reg))
+		if err != nil {
+			return errors.Wrap(err, "failed to create matchers cache")
+		}
+		multiTSDBOptions = append(multiTSDBOptions, receive.WithMatchersCache(cache))
 	}
 
 	dbs := receive.NewMultiTSDB(
@@ -388,25 +392,6 @@ func runReceive(
 				w.WriteHeader(http.StatusOK)
 			}
 		}))
-		srv.Handle("/-/matchers", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			if matcherConverter != nil {
-				labelMatchers := matcherConverter.Keys()
-				// Convert the slice to JSON
-				jsonData, err := json.Marshal(labelMatchers)
-				if err != nil {
-					http.Error(w, "Failed to encode JSON", http.StatusInternalServerError)
-					return
-				}
-
-				// Set the Content-Type header and write the response
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				if _, err := w.Write(jsonData); err != nil {
-					level.Error(logger).Log("msg", "failed to write matchers json", "err", err)
-				}
-			}
-		}))
 		g.Add(func() error {
 			statusProber.Healthy()
 			return srv.ListenAndServe()
@@ -430,11 +415,9 @@ func runReceive(
 		}
 		options := []store.ProxyStoreOption{
 			store.WithProxyStoreDebugLogging(debugLogging),
+			store.WithMatcherCache(cache),
 			store.WithoutDedup(),
 			store.WithLazyRetrievalMaxBufferedResponsesForProxy(conf.lazyRetrievalMaxBufferedResponses),
-		}
-		if matcherConverter != nil {
-			options = append(options, store.WithProxyStoreMatcherConverter(matcherConverter))
 		}
 
 		proxy := store.NewProxyStore(
@@ -701,7 +684,7 @@ func setupHashring(g *run.Group,
 					webHandler.Hashring(receive.SingleNodeHashring(conf.endpoint))
 					level.Info(logger).Log("msg", "Empty hashring config. Set up single node hashring.")
 				} else {
-					h, err := receive.NewMultiHashring(algorithm, conf.replicationFactor, c)
+					h, err := receive.NewMultiHashring(algorithm, conf.replicationFactor, c, reg)
 					if err != nil {
 						return errors.Wrap(err, "unable to create new hashring from config")
 					}
@@ -906,36 +889,23 @@ func startTSDBAndUpload(g *run.Group,
 	return nil
 }
 
-func migrateLegacyStorage(logger log.Logger, dataDir, defaultTenantID string) error {
+func createDefautTenantTSDB(logger log.Logger, dataDir, defaultTenantID string) error {
 	defaultTenantDataDir := path.Join(dataDir, defaultTenantID)
 
 	if _, err := os.Stat(defaultTenantDataDir); !os.IsNotExist(err) {
-		level.Info(logger).Log("msg", "default tenant data dir already present, not attempting to migrate storage")
+		level.Info(logger).Log("msg", "default tenant data dir already present, will not create")
 		return nil
 	}
 
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		level.Info(logger).Log("msg", "no existing storage found, no data migration attempted")
+		level.Info(logger).Log("msg", "no existing storage found, not creating default tenant data dir")
 		return nil
 	}
 
-	level.Info(logger).Log("msg", "found legacy storage, migrating to multi-tsdb layout with default tenant", "defaultTenantID", defaultTenantID)
-
-	files, err := os.ReadDir(dataDir)
-	if err != nil {
-		return errors.Wrapf(err, "read legacy data dir: %v", dataDir)
-	}
+	level.Info(logger).Log("msg", "default tenant data dir not found, creating", "defaultTenantID", defaultTenantID)
 
 	if err := os.MkdirAll(defaultTenantDataDir, 0750); err != nil {
 		return errors.Wrapf(err, "create default tenant data dir: %v", defaultTenantDataDir)
-	}
-
-	for _, f := range files {
-		from := path.Join(dataDir, f.Name())
-		to := path.Join(defaultTenantDataDir, f.Name())
-		if err := os.Rename(from, to); err != nil {
-			return errors.Wrapf(err, "migrate file from %v to %v", from, to)
-		}
 	}
 
 	return nil
@@ -984,18 +954,22 @@ type receiveConfig struct {
 	compression         string
 	replicationProtocol string
 
-	tsdbMinBlockDuration         *model.Duration
-	tsdbMaxBlockDuration         *model.Duration
-	tsdbTooFarInFutureTimeWindow *model.Duration
-	tsdbOutOfOrderTimeWindow     *model.Duration
-	tsdbOutOfOrderCapMax         int64
-	tsdbAllowOverlappingBlocks   bool
-	tsdbMaxExemplars             int64
-	tsdbMaxBytes                 units.Base2Bytes
-	tsdbWriteQueueSize           int64
-	tsdbMemorySnapshotOnShutdown bool
-	tsdbDisableFlushOnShutdown   bool
-	tsdbEnableNativeHistograms   bool
+	tsdbMinBlockDuration          *model.Duration
+	tsdbMaxBlockDuration          *model.Duration
+	tsdbTooFarInFutureTimeWindow  *model.Duration
+	tsdbOutOfOrderTimeWindow      *model.Duration
+	tsdbOutOfOrderCapMax          int64
+	tsdbAllowOverlappingBlocks    bool
+	tsdbMaxExemplars              int64
+	tsdbMaxBytes                  units.Base2Bytes
+	tsdbWriteQueueSize            int64
+	tsdbMemorySnapshotOnShutdown  bool
+	tsdbDisableFlushOnShutdown    bool
+	tsdbEnableNativeHistograms    bool
+	tsdbEnableTenantPathPrefix    bool
+	tsdbPathSegmentsBeforeTenant  []string
+	tsdbHeadChunksWriteBufferSize int
+	tsdbStripeSize                int
 
 	walCompression       bool
 	noLockFile           bool
@@ -1020,9 +994,9 @@ type receiveConfig struct {
 	numTopMetricsPerTenant            int
 	topMetricsMinimumCardinality      uint64
 	topMetricsUpdateInterval          time.Duration
-	matcherConverterCacheCapacity     int
 	maxPendingGrpcWriteRequests       int
 	lazyRetrievalMaxBufferedResponses int
+	matcherCacheSize                  int
 
 	featureList     *[]string
 	noUploadTenants *[]string
@@ -1161,6 +1135,26 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"[EXPERIMENTAL] Enables the ingestion of native histograms.").
 		Default("false").Hidden().BoolVar(&rc.tsdbEnableNativeHistograms)
 
+	cmd.Flag("tsdb.enable-tenant-path-prefix",
+		"[EXPERIMENTAL] Enables the tenant path prefix for object storage.").
+		Default("false").Hidden().BoolVar(&rc.tsdbEnableTenantPathPrefix)
+
+	cmd.Flag("tsdb.path-segments-before-tenant",
+		"[EXPERIMENTAL] Specifies the path segments before the tenant for object storage."+
+			"Must only be used in combination with tsdb.enable-tenant-path-prefix.").
+		Default("raw").Hidden().StringsVar(&rc.tsdbPathSegmentsBeforeTenant)
+
+	cmd.Flag("tsdb.head-chunks-write-buffer-size-bytes",
+		"Configures the write buffer size used by the head chunks mapper. "+
+			"Lower values reduce memory usage but may impact write performance. "+
+			"Min: 65536 (64KB), Max: 8388608 (8MB).").
+		Default("4194304").Hidden().IntVar(&rc.tsdbHeadChunksWriteBufferSize)
+
+	cmd.Flag("tsdb.stripe-size",
+		"The number of shards of series hash map (must be a power of 2). "+
+			"Reducing this will decrease memory footprint, but can negatively impact performance.").
+		Default("16384").Hidden().IntVar(&rc.tsdbStripeSize)
+
 	cmd.Flag("writer.intern",
 		"[EXPERIMENTAL] Enables string interning in receive writer, for more optimized memory usage.").
 		Default("false").Hidden().BoolVar(&rc.writerInterning)
@@ -1176,6 +1170,8 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 			"about order.").
 		Default("false").Hidden().BoolVar(&rc.allowOutOfOrderUpload)
 
+	cmd.Flag("receive.store-matcher-converter-cache-capacity", "Max number of cached matchers items. Using 0 disables caching.").Default("0").IntVar(&rc.matcherCacheSize)
+
 	rc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 
 	rc.writeLimitsConfig = extflag.RegisterPathOrContent(cmd, "receive.limits-config", "YAML file that contains limit configuration.", extflag.WithEnvSubstitution(), extflag.WithHidden())
@@ -1188,8 +1184,6 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 		Default("10000").Uint64Var(&rc.topMetricsMinimumCardinality)
 	cmd.Flag("receive.top-metrics-update-interval", "The interval at which the top metrics are updated.").
 		Default("5m").DurationVar(&rc.topMetricsUpdateInterval)
-	cmd.Flag("receive.store-matcher-converter-cache-capacity", "The number of label matchers to cache in the matcher converter for the Store API. Set to 0 to disable to cache. Default is 0.").
-		Default("0").IntVar(&rc.matcherConverterCacheCapacity)
 	cmd.Flag("receive.max-pending-grcp-write-requests", "Reject right away gRPC write requests when this number of requests are pending. Value 0 disables this feature.").
 		Default("0").IntVar(&rc.maxPendingGrpcWriteRequests)
 	rc.featureList = cmd.Flag("enable-feature", "Experimental feature names to enable. The current list of features is "+metricNamesFilter+", "+grpcReadinessInterceptor+". Repeat this flag to enable multiple features.").Strings()

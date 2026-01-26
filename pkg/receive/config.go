@@ -42,6 +42,27 @@ const (
 	DefaultCapNProtoPort string = "19391"
 )
 
+type endpoints []Endpoint
+
+func (e endpoints) Len() int {
+	return len(e)
+}
+
+func (e endpoints) Less(i, j int) bool {
+	// Sort by address first, then by CapNProtoAddress.
+	// First sort by address, then by CapNProtoAddress, then by AZ.
+	if e[i].Address == e[j].Address {
+		if e[i].CapNProtoAddress == e[j].CapNProtoAddress {
+			return e[i].AZ < e[j].AZ
+		}
+		return e[i].CapNProtoAddress < e[j].CapNProtoAddress
+	}
+	return e[i].Address < e[j].Address
+}
+func (e endpoints) Swap(i, j int) {
+	e[i], e[j] = e[j], e[i]
+}
+
 type Endpoint struct {
 	Address          string `json:"address"`
 	CapNProtoAddress string `json:"capnproto_address"`
@@ -104,6 +125,28 @@ type HashringConfig struct {
 	Endpoints         []Endpoint        `json:"endpoints"`
 	Algorithm         HashringAlgorithm `json:"algorithm,omitempty"`
 	ExternalLabels    labels.Labels     `json:"external_labels,omitempty"`
+	// If non-zero then enable shuffle sharding.
+	ShuffleShardingConfig ShuffleShardingConfig `json:"shuffle_sharding_config,omitempty"`
+}
+
+type ShuffleShardingOverrideConfig struct {
+	ShardSize         int           `json:"shard_size"`
+	Tenants           []string      `json:"tenants,omitempty"`
+	TenantMatcherType tenantMatcher `json:"tenant_matcher_type,omitempty"`
+}
+
+type ShuffleShardingConfig struct {
+	ShardSize int `json:"shard_size"`
+	CacheSize int `json:"cache_size"`
+	// ZoneAwarenessDisabled disables zone awareness. We still try to spread the load
+	// across the available zones, but we don't try to balance the shards across zones.
+	ZoneAwarenessDisabled bool `json:"zone_awareness_disabled"`
+	// AlignedOrdinalSharding enables aligned ordinal selection for shuffle sharding.
+	// When true and using aligned_ketama algorithm, the same ordinals are selected
+	// across all AZs, preserving strict replica alignment. ShardSize represents the
+	// number of ordinals to select (resulting in ShardSize * numAZs total endpoints).
+	AlignedOrdinalSharding bool                            `json:"aligned_ordinal_sharding"`
+	Overrides              []ShuffleShardingOverrideConfig `json:"overrides,omitempty"`
 }
 
 type tenantMatcher string

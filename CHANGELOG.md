@@ -10,7 +10,16 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 
 ## Unreleased
 
+### Added
+
+- [#8238](https://github.com/thanos-io/thanos/pull/8238) Receive: add shuffle sharding support
+
+### Removed
+- [#8289](https://github.com/thanos-io/thanos/pull/8289) Receive: *breaking :warning:* Removed migration of legacy-TSDB to multi-TSDB. Ensure you are running version >0.13
+
 ### Fixed
+
+- [#8378](https://github.com/thanos-io/thanos/pull/8378): Store: fix the reuse of dirty posting slices
 
 ### Added
 

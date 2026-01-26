@@ -24,8 +24,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
@@ -50,6 +52,27 @@ import (
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
 )
+
+// idempotentRegisterer wraps a prometheus.Registerer and ignores duplicate registration errors.
+// This allows running runCompactForTenant multiple times with the same registry without panicking.
+type idempotentRegisterer struct {
+	prometheus.Registerer
+}
+
+func (r *idempotentRegisterer) Register(c prometheus.Collector) error {
+	err := r.Registerer.Register(c)
+	// Ignore duplicate registration errors - expected in multi-tenant mode
+	if _, ok := err.(prometheus.AlreadyRegisteredError); ok {
+		return nil
+	}
+	return err
+}
+
+func (r *idempotentRegisterer) MustRegister(cs ...prometheus.Collector) {
+	for _, c := range cs {
+		_ = r.Register(c) // Ignores duplicates
+	}
+}
 
 var (
 	compactions = compactionSet{
@@ -179,6 +202,16 @@ func runCompact(
 	progressRegistry := compact.NewProgressRegistry(reg, logger)
 	downsampleMetrics := newDownsampleMetrics(reg)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = tracing.ContextWithTracer(ctx, tracer)
+	ctx = objstoretracing.ContextWithTracer(ctx, tracer) // objstore tracing uses a different tracer key in context.
+
+	defer func() {
+		if rerr != nil {
+			cancel()
+		}
+	}()
+
 	httpProbe := prober.NewHTTP()
 	statusProber := prober.Combine(
 		httpProbe,
@@ -207,15 +240,15 @@ func runCompact(
 		return err
 	}
 
-	bkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
-	if conf.enableFolderDeletion {
-		bkt, err = block.WrapWithAzDataLakeSdk(logger, confContentYaml, bkt)
-		level.Info(logger).Log("msg", "azdatalake sdk wrapper enabled", "name", bkt.Name())
+	var initialBucketConf client.BucketConfig
+	if err := yaml.Unmarshal(confContentYaml, &initialBucketConf); err != nil {
+		return errors.Wrap(err, "failed to parse initial bucket configuration")
 	}
+
+	tenantPrefixes, isMultiTenant, err := getTenantsForCompactor(ctx, logger, conf, confContentYaml, component)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to get tenants for compactor")
 	}
-	insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 
 	relabelContentYaml, err := conf.selectorRelabelConf.Content()
 	if err != nil {
@@ -227,13 +260,92 @@ func runCompact(
 		return err
 	}
 
+	globalBkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
+	if err != nil {
+		return errors.Wrap(err, "failed to create global bucket")
+	}
+	if conf.enableFolderDeletion {
+		globalBkt, err = block.WrapWithAzDataLakeSdk(logger, confContentYaml, globalBkt)
+		if err != nil {
+			return errors.Wrap(err, "failed to wrap global bucket with Azure SDK")
+		}
+		level.Info(logger).Log("msg", "azdatalake sdk wrapper enabled for global bucket", "name", globalBkt.Name())
+	}
+	globalInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(globalBkt, extprom.WrapRegistererWithPrefix("thanos_", reg), globalBkt.Name()))
+
 	// Ensure we close up everything properly.
 	defer func() {
-		if err != nil {
-			runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
+		if rerr != nil {
+			runutil.CloseWithLogOnErr(logger, globalInsBkt, "global bucket client")
 		}
 	}()
 
+	globalBlockLister, err := getBlockLister(logger, &conf, globalInsBkt)
+	if err != nil {
+		return errors.Wrap(err, "create global block lister")
+	}
+	globalBaseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, globalInsBkt, globalBlockLister, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
+	if err != nil {
+		return errors.Wrap(err, "create global meta fetcher")
+	}
+
+	api := blocksAPI.NewBlocksAPI(logger, conf.webConf.disableCORS, conf.label, flagsMap, globalInsBkt)
+
+	runWebServer(g, ctx, logger, cancel, reg, &conf, component, tracer, progressRegistry, globalBaseMetaFetcher, api, srv)
+
+	for _, tenantPrefix := range tenantPrefixes {
+		bucketConf := &client.BucketConfig{
+			Type:   initialBucketConf.Type,
+			Config: initialBucketConf.Config,
+			Prefix: path.Join(initialBucketConf.Prefix, tenantPrefix),
+		}
+		level.Info(logger).Log("msg", "starting compaction loop for prefix", "prefix", bucketConf.Prefix)
+
+		tenantConfYaml, err := yaml.Marshal(bucketConf)
+		if err != nil {
+			return errors.Wrap(err, "failed to marshal tenant bucket configuration")
+		}
+
+		bkt, err := getBucketForTenant(logger, isMultiTenant, tenantConfYaml, component, conf, bucketConf, globalBkt)
+		if err != nil {
+			return errors.Wrap(err, "failed to get bucket for tenant")
+		}
+
+		tenantReg, insBkt, tenantLogger, baseMetaFetcher, err := getTenantResources(logger, isMultiTenant, conf, reg, tenantPrefix, bkt, globalInsBkt, globalBaseMetaFetcher)
+		if err != nil {
+			return errors.Wrap(err, "failed to get tenant resources")
+		}
+
+		err = runCompactForTenant(g, ctx, tenantLogger, cancel, tenantReg, insBkt, deleteDelay, conf, relabelConfig, compactMetrics, progressRegistry, downsampleMetrics, baseMetaFetcher, tenantPrefix, api)
+
+		if err != nil {
+			return err
+		}
+
+		level.Info(tenantLogger).Log("msg", "compact node for tenant finished")
+	}
+
+	statusProber.Ready()
+	return nil
+}
+
+func runCompactForTenant(
+	g *run.Group,
+	ctx context.Context,
+	logger log.Logger,
+	cancel context.CancelFunc,
+	reg prometheus.Registerer,
+	insBkt objstore.InstrumentedBucket,
+	deleteDelay time.Duration,
+	conf compactConfig,
+	relabelConfig []*relabel.Config,
+	compactMetrics *compactMetrics,
+	progressRegistry *compact.ProgressRegistry,
+	downsampleMetrics *DownsampleMetrics,
+	baseMetaFetcher *block.BaseFetcher,
+	tenant string,
+	api *blocksAPI.BlocksAPI,
+) error {
 	// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
 	// The delay of deleteDelay/2 is added to ensure we fetch blocks that are meant to be deleted but do not have a replacement yet.
 	// This is to make sure compactor will not accidentally perform compactions with gap instead.
@@ -245,37 +357,9 @@ func runCompact(
 	consistencyDelayMetaFilter := block.NewConsistencyDelayMetaFilter(logger, conf.consistencyDelay, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	timePartitionMetaFilter := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
 
-	var blockLister block.Lister
-	switch syncStrategy(conf.blockListStrategy) {
-	case concurrentDiscovery:
-		blockLister = block.NewConcurrentLister(logger, insBkt)
-	case recursiveDiscovery:
-		blockLister = block.NewRecursiveLister(logger, insBkt)
-	default:
-		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
-	}
-	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
-	if err != nil {
-		return errors.Wrap(err, "create meta fetcher")
-	}
+	enableVerticalCompaction, dedupReplicaLabels := checkVerticalCompaction(logger, &conf)
 
-	enableVerticalCompaction := conf.enableVerticalCompaction
-	dedupReplicaLabels := strutil.ParseFlagLabels(conf.dedupReplicaLabels)
-	if len(dedupReplicaLabels) > 0 {
-		enableVerticalCompaction = true
-		level.Info(logger).Log(
-			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(dedupReplicaLabels, ","),
-		)
-	}
-	if enableVerticalCompaction {
-		level.Info(logger).Log(
-			"msg", "vertical compaction is enabled", "compact.enable-vertical-compaction", fmt.Sprintf("%v", conf.enableVerticalCompaction),
-		)
-	}
-	var (
-		api = blocksAPI.NewBlocksAPI(logger, conf.webConf.disableCORS, conf.label, flagsMap, insBkt)
-		sy  *compact.Syncer
-	)
+	var sy *compact.Syncer
 	{
 		filters := []block.MetadataFilter{
 			timePartitionMetaFilter,
@@ -303,6 +387,7 @@ func runCompact(
 		if !conf.wait {
 			syncMetasTimeout = 0
 		}
+		var err error
 		sy, err = compact.NewMetaSyncer(
 			logger,
 			reg,
@@ -319,38 +404,14 @@ func runCompact(
 		}
 	}
 
-	levels, err := compactions.levels(conf.maxCompactionLevel)
+	levels, err := getCompactionLevels(logger, &conf)
 	if err != nil {
-		return errors.Wrap(err, "get compaction levels")
+		return err
 	}
 
-	if conf.maxCompactionLevel < compactions.maxLevel() {
-		level.Warn(logger).Log("msg", "Max compaction level is lower than should be", "current", conf.maxCompactionLevel, "default", compactions.maxLevel())
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = tracing.ContextWithTracer(ctx, tracer)
-	ctx = objstoretracing.ContextWithTracer(ctx, tracer) // objstore tracing uses a different tracer key in context.
-
-	defer func() {
-		if rerr != nil {
-			cancel()
-		}
-	}()
-
-	var mergeFunc storage.VerticalChunkSeriesMergeFunc
-	switch conf.dedupFunc {
-	case compact.DedupAlgorithmPenalty:
-		mergeFunc = dedup.NewChunkSeriesMerger()
-
-		if len(dedupReplicaLabels) == 0 {
-			return errors.New("penalty based deduplication needs at least one replica label specified")
-		}
-	case "":
-		mergeFunc = storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)
-
-	default:
-		return errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
+	mergeFunc, err := getMergeFunc(&conf, dedupReplicaLabels)
+	if err != nil {
+		return errors.Wrap(err, "get merge func")
 	}
 
 	// Instantiate the compactor with different time slices. Timestamps in TSDB
@@ -360,10 +421,16 @@ func runCompact(
 		return errors.Wrap(err, "create compactor")
 	}
 
-	var (
-		compactDir      = path.Join(conf.dataDir, "compact")
+	var compactDir, downsamplingDir string
+	if tenant != "" {
+		// In multi-tenant mode, each tenant gets its own working directory to avoid conflicts
+		compactDir = path.Join(conf.dataDir, "compact", tenant)
+		downsamplingDir = path.Join(conf.dataDir, "downsample", tenant)
+	} else {
+		// Single-tenant mode uses the base directories
+		compactDir = path.Join(conf.dataDir, "compact")
 		downsamplingDir = path.Join(conf.dataDir, "downsample")
-	)
+	}
 
 	if err := os.MkdirAll(compactDir, os.ModePerm); err != nil {
 		return errors.Wrap(err, "create working compact directory")
@@ -418,34 +485,9 @@ func runCompact(
 		return errors.Wrap(err, "create bucket compactor")
 	}
 
-	retentionByResolution := map[compact.ResolutionLevel]time.Duration{
-		compact.ResolutionLevelRaw: time.Duration(conf.retentionRaw),
-		compact.ResolutionLevel5m:  time.Duration(conf.retentionFiveMin),
-		compact.ResolutionLevel1h:  time.Duration(conf.retentionOneHr),
-	}
-
-	if retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() != 0 {
-		// If downsampling is enabled, error if raw retention is not sufficient for downsampling to occur (upper bound 10 days for 1h resolution)
-		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() < downsample.ResLevel1DownsampleRange {
-			return errors.New("raw resolution must be higher than the minimum block size after which 5m resolution downsampling will occur (40 hours)")
-		}
-		level.Info(logger).Log("msg", "retention policy of raw samples is enabled", "duration", retentionByResolution[compact.ResolutionLevelRaw])
-	}
-	if retentionByResolution[compact.ResolutionLevel5m].Milliseconds() != 0 {
-		// If retention is lower than minimum downsample range, then no downsampling at this resolution will be persisted
-		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevel5m].Milliseconds() < downsample.ResLevel2DownsampleRange {
-			return errors.New("5m resolution retention must be higher than the minimum block size after which 1h resolution downsampling will occur (10 days)")
-		}
-		level.Info(logger).Log("msg", "retention policy of 5 min aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel5m])
-	}
-	if retentionByResolution[compact.ResolutionLevel1h].Milliseconds() != 0 {
-		level.Info(logger).Log("msg", "retention policy of 1 hour aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel1h])
-	}
-
-	retentionByTenant, err := compact.ParesRetentionPolicyByTenant(logger, *conf.retentionTenants)
+	retentionByResolution, retentionByTenant, err := getRetentionPolicies(logger, &conf)
 	if err != nil {
-		level.Error(logger).Log("msg", "failed to parse retention policy by tenant", "err", err)
-		return err
+		return errors.Wrap(err, "get retention policies")
 	}
 
 	var cleanMtx sync.Mutex
@@ -616,6 +658,25 @@ func runCompact(
 		cancel()
 	})
 
+	runCleanup(g, ctx, logger, cancel, reg, &conf, progressRegistry, compactMetrics, tsdbPlanner, sy, retentionByResolution, cleanPartialMarked, grouper, tenant)
+
+	return nil
+}
+
+func runWebServer(
+	g *run.Group,
+	ctx context.Context,
+	logger log.Logger,
+	cancel context.CancelFunc,
+	reg *prometheus.Registry,
+	conf *compactConfig,
+	component component.Component,
+	tracer opentracing.Tracer,
+	progressRegistry *compact.ProgressRegistry,
+	baseMetaFetcher *block.BaseFetcher,
+	api *blocksAPI.BlocksAPI,
+	srv *httpserver.Server,
+) {
 	if conf.wait {
 		if !conf.disableWeb {
 			r := route.New()
@@ -662,7 +723,26 @@ func runCompact(
 				cancel()
 			})
 		}
+	}
+}
 
+func runCleanup(
+	g *run.Group,
+	ctx context.Context,
+	logger log.Logger,
+	cancel context.CancelFunc,
+	reg prometheus.Registerer,
+	conf *compactConfig,
+	progressRegistry *compact.ProgressRegistry,
+	compactMetrics *compactMetrics,
+	tsdbPlanner compact.Planner,
+	sy *compact.Syncer,
+	retentionByResolution map[compact.ResolutionLevel]time.Duration,
+	cleanPartialMarked func(*compact.Progress) error,
+	grouper *compact.DefaultGrouper,
+	tenant string,
+) {
+	if conf.wait {
 		// Periodically remove partial blocks and blocks marked for deletion
 		// since one iteration potentially could take a long time.
 		if conf.cleanupBlocksInterval > 0 {
@@ -688,11 +768,11 @@ func runCompact(
 		// Periodically calculate the progress of compaction, downsampling and retention.
 		if conf.progressCalculateInterval > 0 {
 			g.Add(func() error {
-				ps := compact.NewCompactionProgressCalculator(reg, tsdbPlanner)
-				rs := compact.NewRetentionProgressCalculator(reg, retentionByResolution)
+				ps := compact.NewCompactionProgressCalculator(reg, tsdbPlanner, tenant)
+				rs := compact.NewRetentionProgressCalculator(reg, retentionByResolution, tenant)
 				var ds *compact.DownsampleProgressCalculator
 				if !conf.disableDownsampling {
-					ds = compact.NewDownsampleProgressCalculator(reg)
+					ds = compact.NewDownsampleProgressCalculator(reg, tenant)
 				}
 
 				return runutil.Repeat(conf.progressCalculateInterval, ctx.Done(), func() error {
@@ -753,10 +833,223 @@ func runCompact(
 			})
 		}
 	}
+}
 
-	level.Info(logger).Log("msg", "starting compact node")
-	statusProber.Ready()
-	return nil
+func getTenantsForCompactor(ctx context.Context, logger log.Logger, conf compactConfig, confContentYaml []byte, component component.Component) ([]string, bool, error) {
+	var tenantPrefixes []string
+	var isMultiTenant bool
+
+	if conf.enableTenantPathPrefix {
+		isMultiTenant = true
+
+		hostname := os.Getenv("HOSTNAME")
+		ordinal, err := extractOrdinalFromHostname(hostname)
+		if err != nil {
+			return nil, true, errors.Wrapf(err, "failed to extract ordinal from hostname %s", hostname)
+		}
+
+		totalShards := conf.replicas / conf.replicationFactor
+		if conf.replicas%conf.replicationFactor != 0 || conf.replicationFactor <= 0 {
+			return nil, true, errors.Errorf("replicas %d must be divisible by replication factor %d and total shards must be greater than 0", conf.replicas, conf.replicationFactor)
+		}
+
+		if ordinal >= totalShards {
+			return nil, true, errors.Errorf("ordinal %d is greater than total shards %d", ordinal, totalShards)
+		}
+
+		tenantWeightsPath := conf.tenantWeights.Path()
+		if tenantWeightsPath == "" {
+			return nil, true, errors.New("tenant weights file is not set")
+		}
+
+		discoveryBkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
+		if err != nil {
+			return nil, true, errors.Wrapf(err, "failed to create discovery bucket")
+		}
+
+		level.Info(logger).Log("msg", "setting up tenant partitioning", "ordinal", ordinal, "total_shards", totalShards)
+
+		tenantAssignments, err := compact.SetupTenantPartitioning(ctx, discoveryBkt, logger, tenantWeightsPath, conf.commonPathPrefix, totalShards)
+		runutil.CloseWithLogOnErr(logger, discoveryBkt, "discovery bucket")
+		if err != nil {
+			return nil, true, errors.Wrap(err, "failed to setup tenant partitioning")
+		}
+
+		assignedTenants := tenantAssignments[ordinal]
+		if len(assignedTenants) == 0 {
+			level.Warn(logger).Log("msg", "no tenants assigned to this shard", "ordinal", ordinal)
+		}
+
+		// Deduplicate tenants to avoid duplicate metric registration
+		seenTenants := make(map[string]bool)
+		for _, tenant := range assignedTenants {
+			tenantPrefix := path.Join(conf.commonPathPrefix, tenant)
+			if !seenTenants[tenantPrefix] {
+				seenTenants[tenantPrefix] = true
+				tenantPrefixes = append(tenantPrefixes, tenantPrefix)
+			}
+		}
+
+		level.Info(logger).Log("msg", "tenant partitioning setup complete", "tenant_prefixes", strings.Join(tenantPrefixes, ","))
+	} else {
+		isMultiTenant = false
+		tenantPrefixes = []string{""}
+		level.Info(logger).Log("msg", "single tenant mode")
+	}
+	return tenantPrefixes, isMultiTenant, nil
+}
+
+func getBucketForTenant(logger log.Logger, isMultiTenant bool, tenantConfYaml []byte, component component.Component, conf compactConfig, bucketConf *client.BucketConfig, globalBkt objstore.Bucket) (objstore.Bucket, error) {
+	if isMultiTenant {
+		bkt, err := client.NewBucket(logger, tenantConfYaml, component.String(), nil)
+		if conf.enableFolderDeletion {
+			bkt, err = block.WrapWithAzDataLakeSdk(logger, tenantConfYaml, bkt)
+			level.Info(logger).Log("msg", "azdatalake sdk wrapper enabled", "prefix", bucketConf.Prefix, "name", bkt.Name())
+		}
+		return bkt, err
+	}
+	return globalBkt, nil
+}
+
+func getTenantResources(
+	logger log.Logger,
+	isMultiTenant bool,
+	conf compactConfig,
+	reg prometheus.Registerer,
+	tenantPrefix string,
+	bkt objstore.Bucket,
+	globalInsBkt objstore.InstrumentedBucket,
+	globalBaseMetaFetcher *block.BaseFetcher,
+) (prometheus.Registerer, objstore.InstrumentedBucket, log.Logger, *block.BaseFetcher, error) {
+	var tenantReg prometheus.Registerer
+	var insBkt objstore.InstrumentedBucket
+	var tenantLogger log.Logger
+	var baseMetaFetcher *block.BaseFetcher
+
+	if isMultiTenant {
+		// Use idempotent registerer to ignore duplicate metric registrations across tenants.
+		// Components extract tenant from block metadata and use it as a variable label.
+		tenantReg = &idempotentRegisterer{Registerer: reg}
+		tenantLogger = log.With(logger, "tenant", tenantPrefix)
+		// Only wrap with tracing, not metrics (to avoid duplicate bucket metric registration)
+		insBkt = objstoretracing.WrapWithTraces(bkt)
+
+		// Create tenant-scoped block lister and fetcher so each tenant only sees their own blocks
+		tenantBlockLister, err := getBlockLister(tenantLogger, &conf, insBkt)
+		if err != nil {
+			return nil, nil, nil, nil, errors.Wrap(err, "create tenant block lister")
+		}
+		baseMetaFetcher, err = block.NewBaseFetcher(tenantLogger, conf.blockMetaFetchConcurrency, insBkt, tenantBlockLister, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", tenantReg))
+		if err != nil {
+			return nil, nil, nil, nil, errors.Wrap(err, "create tenant meta fetcher")
+		}
+	} else {
+		tenantReg = reg
+		tenantLogger = logger
+		insBkt = globalInsBkt
+		baseMetaFetcher = globalBaseMetaFetcher
+	}
+	return tenantReg, insBkt, tenantLogger, baseMetaFetcher, nil
+}
+
+func getBlockLister(logger log.Logger, conf *compactConfig, insBkt objstore.InstrumentedBucketReader) (block.Lister, error) {
+	switch syncStrategy(conf.blockListStrategy) {
+	case concurrentDiscovery:
+		return block.NewConcurrentLister(logger, insBkt), nil
+	case recursiveDiscovery:
+		return block.NewRecursiveLister(logger, insBkt), nil
+	default:
+		return nil, errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
+	}
+}
+
+func checkVerticalCompaction(logger log.Logger, conf *compactConfig) (bool, []string) {
+	enableVerticalCompaction := conf.enableVerticalCompaction
+	dedupReplicaLabels := strutil.ParseFlagLabels(conf.dedupReplicaLabels)
+
+	if len(dedupReplicaLabels) > 0 {
+		enableVerticalCompaction = true
+		level.Info(logger).Log(
+			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(dedupReplicaLabels, ","),
+		)
+	}
+	if enableVerticalCompaction {
+		level.Info(logger).Log(
+			"msg", "vertical compaction is enabled", "compact.enable-vertical-compaction", fmt.Sprintf("%v", conf.enableVerticalCompaction),
+		)
+	}
+	return enableVerticalCompaction, dedupReplicaLabels
+}
+
+func getCompactionLevels(logger log.Logger, conf *compactConfig) ([]int64, error) {
+	levels, err := compactions.levels(conf.maxCompactionLevel)
+	if err != nil {
+		return nil, errors.Wrap(err, "get compaction levels")
+	}
+
+	if conf.maxCompactionLevel < compactions.maxLevel() {
+		level.Warn(logger).Log("msg", "Max compaction level is lower than should be", "current", conf.maxCompactionLevel, "default", compactions.maxLevel())
+	}
+
+	return levels, nil
+}
+
+func getMergeFunc(conf *compactConfig, dedupReplicaLabels []string) (storage.VerticalChunkSeriesMergeFunc, error) {
+	var mergeFunc storage.VerticalChunkSeriesMergeFunc
+	switch conf.dedupFunc {
+	case compact.DedupAlgorithmPenalty:
+		mergeFunc = dedup.NewChunkSeriesMerger()
+
+		if len(dedupReplicaLabels) == 0 {
+			return nil, errors.New("penalty based deduplication needs at least one replica label specified")
+		}
+	case "":
+		mergeFunc = storage.NewCompactingChunkSeriesMerger(storage.ChainedSeriesMerge)
+
+	default:
+		return nil, errors.Errorf("unsupported deduplication func, got %s", conf.dedupFunc)
+	}
+
+	return mergeFunc, nil
+}
+
+func getRetentionPolicies(logger log.Logger, conf *compactConfig) (map[compact.ResolutionLevel]time.Duration, map[string]compact.RetentionPolicy, error) {
+	retentionByResolution := map[compact.ResolutionLevel]time.Duration{
+		compact.ResolutionLevelRaw: time.Duration(conf.retentionRaw),
+		compact.ResolutionLevel5m:  time.Duration(conf.retentionFiveMin),
+		compact.ResolutionLevel1h:  time.Duration(conf.retentionOneHr),
+	}
+
+	if retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() != 0 {
+		// If downsampling is enabled, error if raw retention is not sufficient for downsampling to occur (upper bound 10 days for 1h resolution)
+		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevelRaw].Milliseconds() < downsample.ResLevel1DownsampleRange {
+			return nil, nil, errors.New("raw resolution must be higher than the minimum block size after which 5m resolution downsampling will occur (40 hours)")
+		}
+		level.Info(logger).Log("msg", "retention policy of raw samples is enabled", "duration", retentionByResolution[compact.ResolutionLevelRaw])
+	}
+	if retentionByResolution[compact.ResolutionLevel5m].Milliseconds() != 0 {
+		// If retention is lower than minimum downsample range, then no downsampling at this resolution will be persisted
+		if !conf.disableDownsampling && retentionByResolution[compact.ResolutionLevel5m].Milliseconds() < downsample.ResLevel2DownsampleRange {
+			return nil, nil, errors.New("5m resolution retention must be higher than the minimum block size after which 1h resolution downsampling will occur (10 days)")
+		}
+		level.Info(logger).Log("msg", "retention policy of 5 min aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel5m])
+	}
+	if retentionByResolution[compact.ResolutionLevel1h].Milliseconds() != 0 {
+		level.Info(logger).Log("msg", "retention policy of 1 hour aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel1h])
+	}
+
+	retentionByTenant, err := compact.ParesRetentionPolicyByTenant(logger, *conf.retentionTenants)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to parse retention policy by tenant", "err", err)
+		return nil, nil, err
+	}
+
+	return retentionByResolution, retentionByTenant, nil
+}
+
+func extractOrdinalFromHostname(hostname string) (int, error) {
+	parts := strings.Split(hostname, "-")
+	return strconv.Atoi(parts[len(parts)-1])
 }
 
 type compactConfig struct {
@@ -797,6 +1090,11 @@ type compactConfig struct {
 	progressCalculateInterval                      time.Duration
 	filterConf                                     *store.FilterConfig
 	disableAdminOperations                         bool
+	tenantWeights                                  extflag.PathOrContent
+	replicas                                       int
+	replicationFactor                              int
+	commonPathPrefix                               string
+	enableTenantPathPrefix                         bool
 }
 
 func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -912,6 +1210,20 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 	cmd.Flag("web.disable", "Disable Block Viewer UI.").Default("false").BoolVar(&cc.disableWeb)
 
 	cc.selectorRelabelConf = *extkingpin.RegisterSelectorRelabelFlags(cmd)
+
+	cc.tenantWeights = *extflag.RegisterPathOrContent(cmd, "compact.tenant-weights", "YAML file that contains the tenant weights for tenant partitioning.", extflag.WithEnvSubstitution())
+
+	cmd.Flag("compact.replicas", "Total replicas of the stateful set.").
+		Default("1").IntVar(&cc.replicas)
+
+	cmd.Flag("compact.replication-factor", "Replication factor of the stateful set.").
+		Default("1").IntVar(&cc.replicationFactor)
+
+	cmd.Flag("compact.common-path-prefix", "Common path prefix for tenant discovery when using tenant partitioning. This is the prefix before the tenant name in the object storage path.").
+		Default("v1/raw/").StringVar(&cc.commonPathPrefix)
+
+	cmd.Flag("compact.enable-tenant-path-prefix", "Enable tenant path prefix mode for backward compatibility. When disabled, compactor runs in single-tenant mode.").
+		Default("false").BoolVar(&cc.enableTenantPathPrefix)
 
 	cc.webConf.registerFlag(cmd)
 
